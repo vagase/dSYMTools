@@ -56,7 +56,7 @@
 /**
  *  显示错误内存地址
  */
-@property (weak) IBOutlet NSTextField *errorMemoryAddressLabel;
+@property (unsafe_unretained) IBOutlet NSTextView *errorMemoryAddressView;
 
 /**
  *  错误信息
@@ -66,6 +66,10 @@
 
 
 @property (weak) IBOutlet ArchiveFilesScrollView *archiveFilesScrollView;
+
+@property (weak) IBOutlet NSProgressIndicator *progressIndicator;
+
+@property (weak) IBOutlet NSTextField *timeCostLabel;
 
 @end
 
@@ -81,6 +85,9 @@
 
     NSArray *archiveFilePaths = [self allDSYMFilePath];
     [self handleArchiveFileWithPath:archiveFilePaths];
+    
+    self.errorMemoryAddressView.font = [NSFont fontWithName:@"Monaco" size:12];
+    self.errorMessageView.font = [NSFont fontWithName:@"Monaco" size:12];
 }
 
 /**
@@ -316,7 +323,7 @@
     _selectedUUIDInfo = nil;
     self.selectedUUIDLabel.stringValue = @"";
     self.defaultSlideAddressLabel.stringValue = @"";
-    self.errorMemoryAddressLabel.stringValue = @"";
+    [self.errorMemoryAddressView setString:@""];
     [self.errorMessageView setString:@""];
 }
 
@@ -332,6 +339,69 @@
     NSLog(@"double action");
 }
 
+- (NSString *) analyzeAddress:(NSString *)addr {
+    NSString *commandString = [NSString stringWithFormat:@"xcrun atos -arch %@ -o \"%@\" -l %@ %@", self.selectedUUIDInfo.arch, self.selectedUUIDInfo.executableFilePath, self.defaultSlideAddressLabel.stringValue, addr];
+    return [self runCommand:commandString];
+}
+
+- (NSString *) analyzeLine:(NSString *)line {
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(0x[0-9|a-f]+)"
+                                                                           options:NSRegularExpressionCaseInsensitive
+                                                                             error:nil];
+    NSArray *matches = [regex matchesInString:line options:0 range:NSMakeRange(0, line.length)];
+    if (!matches) {
+        NSLog(@"* Can not analyze line:%@", line);
+        return line;
+    }
+    
+    NSTextCheckingResult *match = matches[0];
+    NSString *addr = [line substringWithRange:match.range];
+    NSString *analyzedAddr = [self analyzeAddress:addr];
+    
+    NSString *result = line;
+    if (![addr isEqualToString:analyzedAddr]) {
+        if (line.length > match.range.length) {
+            // crash log
+            result = [NSString stringWithFormat:@"%@ %@", [line substringToIndex:match.range.location + match.range.length], analyzedAddr];
+        }
+        else {
+            // 单个的地址
+            result = analyzedAddr;
+        }
+    }
+    
+    return result;
+}
+
+- (void) analyzeCrash:(NSString *)string complete:(void (^)(NSString *lineOutput))complete {
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
+    
+    dispatch_async(queue, ^{
+        NSArray *lines = [string componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+        NSMutableArray *outputLines = [NSMutableArray arrayWithArray:lines];
+        
+        dispatch_group_t group = dispatch_group_create();
+        
+        [lines enumerateObjectsUsingBlock:^(NSString *line, NSUInteger idx, BOOL * _Nonnull stop) {
+            
+            dispatch_group_async(group, queue, ^{
+                NSString *lineOutput = [self analyzeLine:line];
+                [outputLines replaceObjectAtIndex:idx withObject:lineOutput];
+            });
+        }];
+        
+        dispatch_group_notify(group, queue, ^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *string = [outputLines componentsJoinedByString:@""];
+                
+                if (complete) {
+                    complete(string);
+                }
+            });
+        });
+    });
+}
+
 - (IBAction)analyse:(id)sender {
     if(self.selectedArchiveInfo == nil){
         return;
@@ -345,13 +415,23 @@
         return;
     }
 
-    if([self.errorMemoryAddressLabel.stringValue isEqualToString:@""]){
+    if([self.errorMemoryAddressView.string isEqualToString:@""]){
         return;
     }
-
-    NSString *commandString = [NSString stringWithFormat:@"xcrun atos -arch %@ -o \"%@\" -l %@ %@", self.selectedUUIDInfo.arch, self.selectedUUIDInfo.executableFilePath, self.defaultSlideAddressLabel.stringValue, self.errorMemoryAddressLabel.stringValue];
-    NSString *result = [self runCommand:commandString];
-    [self.errorMessageView setString:result];
+    
+    self.errorMessageView.string = @"";
+    self.timeCostLabel.stringValue = @"";
+    [self.progressIndicator startAnimation:nil];
+    
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    
+    __weak typeof(self) weakSelf = self;
+    [self analyzeCrash:self.errorMemoryAddressView.string complete:^(NSString *output) {
+        weakSelf.errorMessageView.string = output;
+        
+        weakSelf.timeCostLabel.stringValue = [NSString stringWithFormat:@"%@ms", @((long)((CFAbsoluteTimeGetCurrent() - startTime) * 1000))];
+        [weakSelf.progressIndicator stopAnimation:nil];
+    }];
 }
 
 
